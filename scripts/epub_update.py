@@ -58,17 +58,32 @@ def find_opf_path(zf: zipfile.ZipFile) -> str:
 
 
 def set_dc_element(metadata: ET.Element, tag: str, values: list[str]):
-    """Set a Dublin Core metadata element, replacing any existing ones."""
+    """Set a Dublin Core metadata element, preserving attributes on existing ones.
+
+    Updates existing elements in-place so that id attributes and associated
+    <meta refines="..."> relationships survive. Only adds new elements when
+    there are more values than existing elements. Removes surplus elements
+    and cleans up any orphaned <meta refines="..."> that referenced them.
+    """
     full_tag = f"{{{NS['dc']}}}{tag}"
+    existing = metadata.findall(f"dc:{tag}", NS)
 
-    # Remove existing elements with this tag
-    for existing in metadata.findall(f"dc:{tag}", NS):
-        metadata.remove(existing)
+    # Update existing elements in-place (preserves id and other attributes)
+    for i, value in enumerate(values):
+        if i < len(existing):
+            existing[i].text = value
+        else:
+            el = ET.SubElement(metadata, full_tag)
+            el.text = value
 
-    # Add new elements
-    for value in values:
-        el = ET.SubElement(metadata, full_tag)
-        el.text = value
+    # Remove surplus existing elements and their associated refines
+    for el in existing[len(values):]:
+        el_id = el.get("id")
+        if el_id:
+            for meta in metadata.findall("opf:meta", NS):
+                if meta.get("refines") == f"#{el_id}":
+                    metadata.remove(meta)
+        metadata.remove(el)
 
 
 def load_metadata_file(path: str) -> dict:
