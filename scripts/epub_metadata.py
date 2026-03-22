@@ -5,14 +5,18 @@ Usage:
     python3 epub_metadata.py <file.epub> [--json]
 
 Outputs structured metadata to stdout. Use --json for machine-readable output.
-No external dependencies — uses only the Python 3 standard library.
+Requires rdflib for RDF graph construction and JSON-LD serialization.
 """
 
 import json
+import re
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import PurePosixPath
+
+from rdflib import Graph, URIRef, Literal, BNode, Namespace, RDF
+from rdflib.namespace import DC, DCTERMS
 
 
 # XML namespaces used in EPUB
@@ -23,6 +27,21 @@ NS = {
     "ncx": "http://www.daisy.org/z3986/2005/ncx/",
     "xhtml": "http://www.w3.org/1999/xhtml",
     "epub": "http://www.idpf.org/2007/ops",
+}
+
+# EPUB 3 default vocabulary for unprefixed property values
+EPUB_DEFAULT_VOCAB = "http://idpf.org/epub/vocab/package/#"
+
+# EPUB 3 reserved prefixes (always available without declaration)
+EPUB3_RESERVED_PREFIXES = {
+    "dcterms": "http://purl.org/dc/terms/",
+    "marc": "http://id.loc.gov/vocabulary/relators/",
+    "media": "http://www.idpf.org/epub/vocab/overlays/#",
+    "onix": "http://www.editeur.org/ONIX/book/codelists/current.html#",
+    "rendition": "http://www.idpf.org/vocab/rendition/#",
+    "schema": "https://schema.org/",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "a11y": "http://www.idpf.org/epub/vocab/package/a11y/#",
 }
 
 
@@ -40,52 +59,175 @@ def find_opf_path(zf: zipfile.ZipFile) -> str:
     return rootfile.attrib["full-path"]
 
 
+def _parse_opf_prefixes(opf_root: ET.Element) -> dict[str, str]:
+    """Parse the <package prefix="..."> attribute into a prefix-to-URI dict.
+
+    Includes EPUB 3 reserved prefixes as defaults, then overlays any
+    prefixes declared in the OPF package element.
+    """
+    prefixes = dict(EPUB3_RESERVED_PREFIXES)
+    prefix_attr = opf_root.get("prefix", "")
+    if prefix_attr:
+        for match in re.finditer(r"(\S+):\s+(\S+)", prefix_attr):
+            prefixes[match.group(1)] = match.group(2)
+    return prefixes
+
+
+def _resolve_property(prop_value: str, prefixes: dict[str, str]) -> URIRef:
+    """Resolve an OPF property string to a full URIRef.
+
+    Prefixed values (e.g., "dcterms:modified") are expanded using the
+    prefix map. Unprefixed values use the EPUB default vocabulary.
+    """
+    if ":" in prop_value:
+        prefix, local = prop_value.split(":", 1)
+        if prefix in prefixes:
+            return URIRef(prefixes[prefix] + local)
+    return URIRef(EPUB_DEFAULT_VOCAB + prop_value)
+
+
+def _inline_bnodes(jsonld: dict) -> dict:
+    """Inline blank-node entries from @graph into their parent references.
+
+    rdflib serializes BNodes as separate @graph entries with references like
+    {"@id": "_:N..."}.  This function embeds them at the point of reference
+    and strips the internal BNode @id values.
+    """
+    if not isinstance(jsonld, dict) or "@graph" not in jsonld:
+        return jsonld
+
+    graph = jsonld["@graph"]
+    context = jsonld.get("@context", {})
+
+    # Index BNodes by @id
+    bnodes: dict[str, dict] = {}
+    for node in graph:
+        nid = node.get("@id", "")
+        if nid.startswith("_:"):
+            bnodes[nid] = node
+
+    def _embed(obj):
+        """Recursively replace BNode references with their content."""
+        if isinstance(obj, dict):
+            nid = obj.get("@id", "")
+            if nid.startswith("_:") and nid in bnodes and len(obj) == 1:
+                # This is a bare reference — replace with the full BNode
+                embedded = {k: _embed(v) for k, v in bnodes[nid].items()
+                            if k != "@id"}
+                return embedded
+            return {k: _embed(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_embed(item) for item in obj]
+        return obj
+
+    # Find the publication node (non-BNode) and embed BNodes into it
+    for node in graph:
+        nid = node.get("@id", "")
+        if not nid.startswith("_:"):
+            result = _embed(node)
+            result["@context"] = context
+            return result
+
+    # Fallback: return first node
+    if graph:
+        result = _embed(graph[0])
+        result.pop("@id", None)
+        result["@context"] = context
+        return result
+
+    return jsonld
+
+
 def parse_metadata(opf_root: ET.Element) -> dict:
-    """Extract Dublin Core and OPF metadata from the package document as JSON-LD."""
+    """Extract metadata from the OPF package document as JSON-LD.
+
+    Uses rdflib to build an RDF graph from OPF metadata, then serializes
+    to JSON-LD. DC elements with <meta refines="#id"> become structured
+    nodes (BNodes with rdf:value + refinement predicates). Non-refining
+    <meta property="..."> elements become direct predicates on the
+    publication node.
+    """
     metadata_el = opf_root.find("opf:metadata", NS)
     if metadata_el is None:
         return {}
 
-    result = {
-        "@context": {
-            "dc": "http://purl.org/dc/elements/1.1/",
-            "dcterms": "http://purl.org/dc/terms/",
-        },
-        "@type": "dcterms:BibliographicResource",
-    }
+    prefixes = _parse_opf_prefixes(opf_root)
 
-    # Dublin Core elements
+    EPUB_NS = Namespace(EPUB_DEFAULT_VOCAB)
+    SCHEMA = Namespace("https://schema.org/")
+
+    g = Graph()
+    g.bind("dc", DC)
+    g.bind("dcterms", DCTERMS)
+    g.bind("epub", EPUB_NS)
+    g.bind("schema", SCHEMA)
+
+    # Build refinements index: {element_id: [(property_uri, value), ...]}
+    refinements: dict[str, list[tuple[URIRef, str]]] = {}
+    for meta in metadata_el.findall("opf:meta", NS):
+        refines = meta.get("refines", "")
+        if refines and refines.startswith("#"):
+            el_id = refines[1:]
+            prop = meta.get("property", "")
+            if prop and meta.text and meta.text.strip():
+                prop_uri = _resolve_property(prop, prefixes)
+                refinements.setdefault(el_id, []).append(
+                    (prop_uri, meta.text.strip())
+                )
+
+    # Determine publication node from dc:identifier
+    id_el = metadata_el.find("dc:identifier", NS)
+    if id_el is not None and id_el.text and ":" in id_el.text.strip():
+        pub = URIRef(id_el.text.strip())
+    else:
+        pub = BNode()
+
+    g.add((pub, RDF.type, DCTERMS.BibliographicResource))
+
+    # Process DC elements
     dc_fields = [
         "title", "creator", "subject", "description", "publisher",
         "contributor", "date", "type", "format", "identifier",
         "source", "language", "relation", "coverage", "rights",
     ]
     for field in dc_fields:
-        elements = metadata_el.findall(f"dc:{field}", NS)
-        if elements:
-            values = [el.text.strip() for el in elements if el.text]
-            if len(values) == 1:
-                result[f"dc:{field}"] = values[0]
-            elif values:
-                result[f"dc:{field}"] = values
+        for el in metadata_el.findall(f"dc:{field}", NS):
+            if not el.text or not el.text.strip():
+                continue
+            text = el.text.strip()
+            el_id = el.get("id")
+            dc_pred = DC[field]
 
-    # OPF meta elements — promote dc:/dcterms: to top-level, collect others in epubMeta
-    epub_meta = []
+            if el_id and el_id in refinements:
+                node = BNode()
+                g.add((pub, dc_pred, node))
+                g.add((node, RDF.value, Literal(text)))
+                for prop_uri, val in refinements[el_id]:
+                    g.add((node, prop_uri, Literal(val)))
+            else:
+                g.add((pub, dc_pred, Literal(text)))
+
+    # Non-refining <meta property="..."> elements become direct predicates
     for meta in metadata_el.findall("opf:meta", NS):
+        if meta.get("refines"):
+            continue
         prop = meta.get("property", "")
-        if prop.startswith("dc:") or prop.startswith("dcterms:"):
-            value = meta.text.strip() if meta.text and meta.text.strip() else ""
-            if value:
-                result[prop] = value
-        else:
-            entry = dict(meta.attrib)
-            if meta.text and meta.text.strip():
-                entry["value"] = meta.text.strip()
-            if entry:
-                epub_meta.append(entry)
-    if epub_meta:
-        result["epubMeta"] = epub_meta
+        if not prop or not meta.text or not meta.text.strip():
+            continue
+        prop_uri = _resolve_property(prop, prefixes)
+        g.add((pub, prop_uri, Literal(meta.text.strip())))
 
+    # Serialize to JSON-LD
+    context = {
+        "dc": str(DC),
+        "dcterms": str(DCTERMS),
+        "rdf": str(RDF),
+        "epub": EPUB_DEFAULT_VOCAB,
+        "schema": "https://schema.org/",
+    }
+
+    jsonld_str = g.serialize(format="json-ld", context=context)
+    result = _inline_bnodes(json.loads(jsonld_str))
     return result
 
 
@@ -277,18 +419,13 @@ def format_text(info: dict) -> str:
     if meta:
         lines.append("── Metadata ──")
         for key, val in meta.items():
-            if key in ("@context", "@type", "epubMeta"):
+            if key.startswith("@"):
                 continue
-            display_key = key
-            if display_key.startswith("dc:"):
-                display_key = display_key[3:]
-            elif display_key.startswith("dcterms:"):
-                display_key = display_key[8:]
-            if isinstance(val, list):
-                for v in val:
-                    lines.append(f"  {display_key}: {v}")
-            else:
-                lines.append(f"  {display_key}: {val}")
+            display_key = key.split(":", 1)[1] if ":" in key else key
+            vals = val if isinstance(val, list) else [val]
+            for v in vals:
+                text = v.get("rdf:value", str(v)) if isinstance(v, dict) else str(v)
+                lines.append(f"  {display_key}: {text}")
         lines.append("")
 
     # TOC

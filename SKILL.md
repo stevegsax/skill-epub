@@ -168,8 +168,20 @@ to EPUB 3. Add `--json` for machine-readable JSON-LD output with Dublin Core voc
 and `dcterms:` terms):
 
 ```bash
+# Full output (metadata, manifest, spine, TOC, file list)
 python3 scripts/epub_metadata.py book.epub --json
+
+# Concise summary (metadata + version only) — prefer this to manage context window
+python3 "$SKILL_DIR/epub_metadata.py" book.epub --json \
+  | jq '{metadata, version, toc_type, file_count}'
+
+# Full output to file for round-trip editing
+python3 "$SKILL_DIR/epub_metadata.py" book.epub --json > metadata.json
 ```
+
+Prefer `jq` filtering or file redirect over raw `--json` output to keep the context window
+manageable. The full output includes manifest, spine, and file list which are rarely needed
+for metadata operations.
 
 Use pandoc to convert an EPUB back to readable text:
 
@@ -287,8 +299,9 @@ If the version is `"3.0"` or higher, conversion is not needed — just validate 
 
 ## Helper Scripts
 
-Two Python helper scripts are bundled in the `scripts/` directory of this skill. Run them
-directly — they have no dependencies beyond the Python 3 standard library.
+Two Python helper scripts are bundled in the `scripts/` directory of this skill.
+`epub_metadata.py` requires `rdflib` (`uv pip install rdflib`). `epub_update.py` uses only
+the Python 3 standard library.
 
 - **`scripts/epub_metadata.py <file.epub> [--json]`** — Extract and display all metadata, TOC
   structure, spine order, and manifest contents from an EPUB file. Reports the EPUB version.

@@ -17,7 +17,8 @@ python3 scripts/epub_update.py book.epub --title "X" # modify metadata
 python3 scripts/epub_update.py book.epub --metadata-file meta.json  # apply JSON-LD metadata
 ```
 
-Both scripts use only the Python 3 standard library — no pip dependencies.
+`epub_metadata.py` requires `rdflib` (`uv pip install rdflib`). `epub_update.py` uses only
+the standard library.
 
 External tools: `pandoc` and `epubcheck` (install via `brew install pandoc epubcheck`).
 
@@ -33,11 +34,13 @@ External tools: `pandoc` and `epubcheck` (install via `brew install pandoc epubc
 
 ## Key Implementation Patterns
 
-**JSON-LD metadata round-trip**: `epub_metadata.py --json` produces JSON-LD with `@context`,
-`@type`, and `dc:`-prefixed keys. `epub_update.py --metadata-file` reads that format back,
-mapping `dc:*` keys to CLI field names. `dcterms:modified` is handled separately as an OPF
-`<meta property="...">` element rather than a DC element. Non-DC meta entries go into an
-`epubMeta` array to avoid data loss.
+**JSON-LD metadata round-trip**: `epub_metadata.py --json` uses rdflib to build a proper RDF
+graph from OPF metadata and serializes it as JSON-LD. DC elements with `<meta refines="#id">`
+become structured nodes (BNodes with `rdf:value` + refinement predicates like `epub:role`).
+Non-refining `<meta property>` elements (e.g., `schema:accessMode`, `dcterms:modified`) become
+direct predicates on the publication node. `epub_update.py --metadata-file` reads that format
+back, using `_extract_rdf_value()` to handle both simple literals and structured BNode objects
+when mapping `dc:*` keys to CLI field names.
 
 **XML namespace handling**: Both scripts define an `NS` dict mapping prefixes to URIs.
 `epub_update.py` registers namespaces via `ET.register_namespace()` so prefixes survive

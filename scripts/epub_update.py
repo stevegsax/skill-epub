@@ -21,6 +21,7 @@ Options:
     --dry-run            Show what would change without modifying the file
 
 No external dependencies — uses only the Python 3 standard library.
+Note: epub_metadata.py (which produces the JSON-LD input) requires rdflib.
 """
 
 import argparse
@@ -86,11 +87,27 @@ def set_dc_element(metadata: ET.Element, tag: str, values: list[str]):
         metadata.remove(el)
 
 
+def _extract_rdf_value(val):
+    """Extract plain values from JSON-LD nodes.
+
+    Handles strings (pass through), dicts (extract rdf:value or @value),
+    and lists (map recursively).
+    """
+    if isinstance(val, str):
+        return val
+    if isinstance(val, dict):
+        return val.get("rdf:value", val.get("@value", str(val)))
+    if isinstance(val, list):
+        return [_extract_rdf_value(v) for v in val]
+    return val
+
+
 def load_metadata_file(path: str) -> dict:
     """Load metadata from a JSON-LD file produced by epub_metadata.py.
 
-    Returns a dict with CLI-compatible field names and optionally a
-    'dcterms:modified' key for the OPF meta element.
+    Handles both simple literal values and structured BNode objects
+    (dicts with rdf:value). Returns a dict with CLI-compatible field
+    names and optionally a 'dcterms:modified' key for the OPF meta element.
     """
     with open(path) as f:
         data = json.load(f)
@@ -111,10 +128,10 @@ def load_metadata_file(path: str) -> dict:
     result = {}
     for dc_key, cli_key in dc_to_cli.items():
         if dc_key in meta:
-            result[cli_key] = meta[dc_key]
+            result[cli_key] = _extract_rdf_value(meta[dc_key])
 
     if "dcterms:modified" in meta:
-        result["dcterms:modified"] = meta["dcterms:modified"]
+        result["dcterms:modified"] = _extract_rdf_value(meta["dcterms:modified"])
 
     return result
 
