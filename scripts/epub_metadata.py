@@ -2,11 +2,17 @@
 """Extract and display metadata, TOC, spine, and manifest from an EPUB file.
 
 Usage:
-    python3 epub_metadata.py <file.epub> [--json]
+    uv run epub_metadata.py <file.epub> [--json]
 
 Outputs structured metadata to stdout. Use --json for machine-readable output.
-Requires rdflib for RDF graph construction and JSON-LD serialization.
+rdflib (RDF graph construction + JSON-LD serialization) is declared inline via
+PEP 723, so `uv run` provisions it automatically — no separate install needed.
 """
+
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["rdflib"]
+# ///
 
 import json
 import re

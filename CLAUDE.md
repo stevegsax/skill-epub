@@ -11,16 +11,16 @@ helper tools invoked by the skill at runtime.
 ## Running the Scripts
 
 ```bash
-python3 scripts/epub_metadata.py book.epub          # human-readable output
-python3 scripts/epub_metadata.py book.epub --json    # JSON-LD with Dublin Core vocabulary
+uv run --no-project scripts/epub_metadata.py book.epub        # human-readable output
+uv run --no-project scripts/epub_metadata.py book.epub --json # JSON-LD with Dublin Core vocabulary
 python3 scripts/epub_update.py book.epub --title "X" # modify metadata
 python3 scripts/epub_update.py book.epub --metadata-file meta.json  # apply JSON-LD metadata
 ```
 
-`epub_metadata.py` requires `rdflib` (`uv pip install rdflib`). `epub_update.py` uses only
-the standard library.
+`epub_metadata.py` declares its `rdflib` dependency inline (PEP 723), so `uv run` provisions
+it automatically — no separate install. `epub_update.py` uses only the standard library.
 
-External tools: `pandoc` and `epubcheck` (install via `brew install pandoc epubcheck`).
+External tools: `pandoc`, `epubcheck`, and `uv` (install via `brew install pandoc epubcheck uv`).
 
 ## Architecture
 

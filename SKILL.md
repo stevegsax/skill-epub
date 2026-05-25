@@ -41,6 +41,8 @@ than assumed.
   validation (`--profile`), and individual file validation (`--mode`).
 - **unzip / zipinfo** — inspect EPUB internals (built-in on macOS)
 - **Python 3** — run helper scripts for metadata extraction and modification
+- **uv** — runs `epub_metadata.py`; its `rdflib` dependency is declared inline (PEP 723)
+  and provisioned automatically by `uv run` (install via `brew install uv`)
 
 If a required tool is missing, inform the user and provide the install command.
 
@@ -70,11 +72,11 @@ Use pandoc with `-t epub3` to create EPUB 3 files from Markdown, HTML, or other 
 # Basic creation from Markdown
 pandoc input.md -t epub3 -o output.epub
 
-# With metadata
-pandoc input.md -t epub3 -o output.epub \
-  --metadata title="Book Title" \
-  --metadata author="Author Name" \
-  --metadata lang="en-US"
+# With metadata — keep metadata in a file (see the YAML example below), not
+# inline --metadata flags. A file is reusable and version-controllable, avoids
+# shell-quoting bugs in titles and descriptions, and is the only practical way
+# to express lists (multiple authors, subjects) or an identifier with a scheme.
+pandoc input.md -t epub3 -o output.epub --metadata-file=metadata.yaml
 
 # With cover image, CSS, and table of contents
 # --toc generates an EPUB 3 nav document from headings in the source
@@ -85,30 +87,44 @@ pandoc input.md -t epub3 -o output.epub \
   --toc --toc-depth=2
 
 # From multiple source files (chapters)
-# --epub-chapter-level=N splits output into separate XHTML files at heading level N
+# --split-level=N splits output into separate XHTML files at heading level N
+#   (older pandoc spells this --epub-chapter-level; run `pandoc --help` if unsure)
 # --top-level-division=chapter treats top-level headings as chapters (vs. sections or parts)
 pandoc ch01.md ch02.md ch03.md -t epub3 -o output.epub \
   --metadata-file=metadata.yaml \
   --epub-cover-image=cover.jpg \
   --toc \
-  --epub-chapter-level=1 \
+  --split-level=1 \
   --top-level-division=chapter
 ```
 
-For structured books, use a YAML metadata file:
+Define the metadata in a YAML file. Pandoc maps these fields to the EPUB's Dublin
+Core metadata in the OPF — including lists (each `author` becomes a `dc:creator`
+with a `role`, each `subject` a `dc:subject`) and an `identifier` with a `scheme`,
+none of which can be expressed with repeated `--metadata` flags:
 
 ```yaml
 ---
 title: Book Title
-author: Author Name
+author:
+  - First Author
+  - Second Author
 date: 2026-01-01
 lang: en-US
+publisher: Publisher Name
 rights: All rights reserved
+subject:
+  - Fiction
+  - Adventure
+identifier:
+  - scheme: ISBN
+    text: 978-0-000-00000-0
 description: A brief description of the book.
 ---
 ```
 
-Pass it with `--metadata-file=metadata.yaml`.
+Pass it with `--metadata-file=metadata.yaml`. Pandoc adds the required
+`dcterms:modified` timestamp automatically.
 
 ### 2. Validate an EPUB
 
@@ -160,7 +176,7 @@ unzip -p book.epub OEBPS/ch01.xhtml
 For structured metadata extraction (including version detection), use the helper script:
 
 ```bash
-python3 scripts/epub_metadata.py book.epub
+uv run --no-project scripts/epub_metadata.py book.epub
 ```
 
 The script reports the EPUB version, which is useful for identifying files that need conversion
@@ -169,14 +185,14 @@ and `dcterms:` terms):
 
 ```bash
 # Full output (metadata, manifest, spine, TOC, file list)
-python3 scripts/epub_metadata.py book.epub --json
+uv run --no-project scripts/epub_metadata.py book.epub --json
 
 # Concise summary (metadata + version only) — prefer this to manage context window
-python3 "$SKILL_DIR/epub_metadata.py" book.epub --json \
+uv run --no-project "$SKILL_DIR/epub_metadata.py" book.epub --json \
   | jq '{metadata, version, toc_type, file_count}'
 
 # Full output to file for round-trip editing
-python3 "$SKILL_DIR/epub_metadata.py" book.epub --json > metadata.json
+uv run --no-project "$SKILL_DIR/epub_metadata.py" book.epub --json > metadata.json
 ```
 
 Prefer `jq` filtering or file redirect over raw `--json` output to keep the context window
@@ -205,7 +221,7 @@ EPUBs can be modified by extracting, editing, and repackaging:
 python3 scripts/epub_update.py book.epub --title "New Title" --author "New Author"
 
 # Round-trip: extract metadata as JSON-LD, edit, and apply back
-python3 scripts/epub_metadata.py book.epub --json > meta.json
+uv run --no-project scripts/epub_metadata.py book.epub --json > meta.json
 # ... edit meta.json ...
 python3 scripts/epub_update.py book.epub --metadata-file meta.json
 
@@ -253,10 +269,14 @@ pandoc old_book.epub -t epub3 -o new_book.epub
 pandoc old_book.epub -t epub3 -o new_book.epub \
   --toc --toc-depth=2
 
-# Override metadata during conversion
-pandoc old_book.epub -t epub3 -o new_book.epub \
-  --metadata title="Updated Title" \
-  --metadata lang="en-US"
+# Override metadata when the input is an EPUB: do NOT pass metadata to pandoc.
+# Pandoc keeps the metadata embedded in an EPUB source — a --metadata-file is
+# ignored entirely, and inline --metadata only partially applies (title changes,
+# language does not). Convert the structure with pandoc first, then edit metadata
+# with epub_update.py, which rewrites the OPF directly.
+pandoc old_book.epub -t epub3 -o new_book.epub
+python3 scripts/epub_update.py new_book.epub --title "Updated Title" --language en-GB
+# epub_update.py also accepts --metadata-file for a saved set of fields (see Update).
 ```
 
 After conversion, always validate the result:
@@ -273,6 +293,10 @@ If epubcheck reports errors, fix them and re-validate. Common post-conversion is
   but verify it exists in the output (`zipinfo -1 new_book.epub | grep -i nav`)
 - **Missing `dcterms:modified`** — Pandoc adds this, but if updating metadata manually,
   ensure it is present
+- **Empty `<dc:date>`** — Converting from an EPUB can leave an empty `<dc:date>` element
+  (pandoc drops the source's date value), which epubcheck rejects as `RSC-005`. Set a valid
+  date — `python3 scripts/epub_update.py new_book.epub --date 2026-01-01` — or remove the
+  element entirely, since `dc:date` is optional in EPUB 3.
 
 For batch conversion of multiple files:
 
@@ -292,7 +316,7 @@ Before converting, check whether a file is already EPUB 3:
 unzip -p book.epub OEBPS/content.opf 2>/dev/null | grep -o 'version="[^"]*"'
 
 # Or use the metadata script for a full report
-python3 scripts/epub_metadata.py book.epub
+uv run --no-project scripts/epub_metadata.py book.epub
 ```
 
 If the version is `"3.0"` or higher, conversion is not needed — just validate with epubcheck.
@@ -300,8 +324,9 @@ If the version is `"3.0"` or higher, conversion is not needed — just validate 
 ## Helper Scripts
 
 Two Python helper scripts are bundled in the `scripts/` directory of this skill.
-`epub_metadata.py` requires `rdflib` (`uv pip install rdflib`). `epub_update.py` uses only
-the Python 3 standard library.
+`epub_metadata.py` declares its `rdflib` dependency inline (PEP 723), so running it with
+`uv run` provisions `rdflib` automatically — no separate install. `epub_update.py` uses only
+the Python 3 standard library, so it runs under plain `python3`.
 
 - **`scripts/epub_metadata.py <file.epub> [--json]`** — Extract and display all metadata, TOC
   structure, spine order, and manifest contents from an EPUB file. Reports the EPUB version.
@@ -317,7 +342,7 @@ Locate the skill directory first:
 # Find the skill directory
 SKILL_DIR=$(find ~/.claude -path "*/skill-epub/scripts" -type d 2>/dev/null | head -1)
 # Run a script
-python3 "$SKILL_DIR/epub_metadata.py" book.epub
+uv run --no-project "$SKILL_DIR/epub_metadata.py" book.epub
 ```
 
 ## EPUB Structure Reference
@@ -329,6 +354,12 @@ document requirements.
 ## Workflow Guidelines
 
 - Always use `-t epub3` when creating or converting EPUBs with pandoc.
+- When creating or converting *into* EPUB from Markdown, HTML, etc., pass metadata to
+  pandoc through a `--metadata-file` (YAML), never inline `--metadata` flags — a file is
+  reusable and auditable, sidesteps shell-quoting issues, and is the only clean way to
+  express multi-valued fields (several authors or subjects) and an identifier with a scheme.
+  To change the metadata of an *existing* EPUB, use `epub_update.py` (which also takes a
+  `--metadata-file`); pandoc does not reliably override metadata embedded in an EPUB input.
 - Always validate after creating or modifying an EPUB with `epubcheck`.
 - When encountering an EPUB 2 file, convert it to EPUB 3 using pandoc before further processing.
 - When the user provides content to convert, prefer Markdown as the intermediate format —
