@@ -1,370 +1,241 @@
 ---
 name: epub
-description: >
-  Use local CLI tools to create, validate, query, update, and convert EPUB files. All output
-  targets EPUB 3 (the current W3C standard, EPUB 3.3). Use when the user mentions EPUB, e-book,
-  ebook, "create an epub", "validate epub", "check epub", "epub metadata", "convert to epub",
-  "convert from epub", "update epub", "modify epub", "inspect epub", "epub table of contents",
-  "epub cover", "upgrade epub", "epub version", "epub 3", or any task involving .epub files.
-  Also trigger when the user wants to package HTML or Markdown content as an e-book, extract
-  content from an EPUB, fix EPUB validation errors, or convert an older EPUB 2 file to EPUB 3.
-  Do NOT use for PDF-only workflows, Kindle-only formats (MOBI/AZW3), or general file conversion
-  that does not involve EPUB.
-allowed-tools:
-  - Read
-  - Write
-  - Edit
-  - Bash
-  - Glob
-  - Grep
+description: >-
+  Creates, validates, inspects, updates, upgrades, and converts EPUB files (EPUB 3.3) with
+  pandoc, EPUBCheck, and bundled Python scripts. Use when the user mentions EPUB, e-book,
+  ebook, or .epub files, or asks to package Markdown or HTML as an e-book, read or change
+  e-book metadata or covers, fix EPUBCheck errors, or upgrade an EPUB 2 file to EPUB 3.
+  Not for PDF-only work or Kindle-only formats (MOBI, AZW3).
+compatibility: >-
+  Needs pandoc, EPUBCheck (Java), and uv installed on the local machine; the bundled scripts
+  declare lxml and rdflib as PEP 723 dependencies, which uv fetches on first run. Written for
+  Claude Code; the Claude API code-execution sandbox has none of these tools.
+allowed-tools: Read Write Edit Glob Grep Bash(uv run --no-project ${CLAUDE_SKILL_DIR}/scripts/*) Bash(pandoc *) Bash(epubcheck *) Bash(unzip *) Bash(zipinfo *) Bash(jq *)
 ---
 
-# EPUB Skill
+# EPUB
 
-Work with EPUB files using local command-line tools. All operations target **EPUB 3** (the
-current W3C standard, EPUB 3.3). EPUB files are ZIP archives containing XHTML5 content,
-metadata, and navigation documents.
+An EPUB is a ZIP archive of XHTML content, a package document (OPF) that lists every file
+and holds the metadata, and a navigation document. Everything this skill produces targets
+EPUB 3 (W3C EPUB 3.3). The bundled scripts in `scripts/` do the structural work; pandoc
+creates and converts books; EPUBCheck validates them. Every script writes a new file and
+refuses to overwrite its input, and every script exits non-zero with a message on stderr
+when it cannot do what was asked, so check exit codes rather than assuming success.
 
-When working with older EPUB 2 files, convert them to EPUB 3 — see the conversion section below.
+## Tools
 
-## Prerequisites
-
-Check tool availability before proceeding. Run `epubcheck --help` and `pandoc --help` to
-confirm available options — these tools evolve and their capabilities should be verified rather
-than assumed.
-
-- **pandoc** — create and convert EPUBs (required; install via `brew install pandoc`).
-  Supports three EPUB output formats: `epub` (defaults to EPUB 3), `epub2`, and `epub3`.
-  Always use `-t epub3` explicitly to ensure EPUB 3 output.
-- **epubcheck** — validate EPUB conformance (recommended; install via `brew install epubcheck`).
-  Validates against EPUB 3 by default. Supports JSON output (`--json`), profile-based
-  validation (`--profile`), and individual file validation (`--mode`).
-- **unzip / zipinfo** — inspect EPUB internals (built-in on macOS)
-- **Python 3** — run helper scripts for metadata extraction and modification
-- **uv** — runs `epub_metadata.py`; its `rdflib` dependency is declared inline (PEP 723)
-  and provisioned automatically by `uv run` (install via `brew install uv`)
-
-If a required tool is missing, inform the user and provide the install command.
-
-## EPUB 3 Requirements
-
-EPUB 3 content must meet these requirements (epubcheck enforces all of them):
-
-- **Package document (OPF)** version attribute must be `"3.0"`
-- **Navigation document** — an XHTML file with `properties="nav"` in the manifest, containing
-  a `<nav epub:type="toc">` element. This replaces the EPUB 2 NCX as the required navigation
-  mechanism (NCX may be included for backward compatibility but is not required).
-- **Content documents** use XHTML5 (not XHTML 1.1), with `xmlns="http://www.w3.org/1999/xhtml"`
-- **Required metadata** — `dc:identifier`, `dc:title`, `dc:language`, and a
-  `<meta property="dcterms:modified">` timestamp
-- **Manifest** items may use `properties` attribute for semantic roles (`nav`, `cover-image`,
-  `mathml`, `svg`, `scripted`, etc.)
-
-Read `references/epub-structure.md` for the full EPUB 3 structure specification.
-
-## Core Operations
-
-### 1. Create an EPUB 3
-
-Use pandoc with `-t epub3` to create EPUB 3 files from Markdown, HTML, or other supported formats.
+Confirm the tools before starting, because versions differ and `epubcheck` is often missing:
 
 ```bash
-# Basic creation from Markdown
-pandoc input.md -t epub3 -o output.epub
-
-# With metadata — keep metadata in a file (see the YAML example below), not
-# inline --metadata flags. A file is reusable and version-controllable, avoids
-# shell-quoting bugs in titles and descriptions, and is the only practical way
-# to express lists (multiple authors, subjects) or an identifier with a scheme.
-pandoc input.md -t epub3 -o output.epub --metadata-file=metadata.yaml
-
-# With cover image, CSS, and table of contents
-# --toc generates an EPUB 3 nav document from headings in the source
-# --toc-depth controls how many heading levels appear (default: 3)
-pandoc input.md -t epub3 -o output.epub \
-  --epub-cover-image=cover.jpg \
-  --css=style.css \
-  --toc --toc-depth=2
-
-# From multiple source files (chapters)
-# --split-level=N splits output into separate XHTML files at heading level N
-#   (older pandoc spells this --epub-chapter-level; run `pandoc --help` if unsure)
-# --top-level-division=chapter treats top-level headings as chapters (vs. sections or parts)
-pandoc ch01.md ch02.md ch03.md -t epub3 -o output.epub \
-  --metadata-file=metadata.yaml \
-  --epub-cover-image=cover.jpg \
-  --toc \
-  --split-level=1 \
-  --top-level-division=chapter
+pandoc --version | head -1      # 3.x expected; EPUB 3 is the default EPUB output
+epubcheck --version             # 5.x expected
+uv --version                    # runs the scripts and fetches their dependencies
 ```
 
-Define the metadata in a YAML file. Pandoc maps these fields to the EPUB's Dublin
-Core metadata in the OPF — including lists (each `author` becomes a `dc:creator`
-with a `role`, each `subject` a `dc:subject`) and an `identifier` with a `scheme`,
-none of which can be expressed with repeated `--metadata` flags:
+If something is missing, tell the user and give the install command: on macOS
+`brew install pandoc epubcheck uv`; on Debian or Ubuntu `sudo apt install pandoc default-jre`
+plus EPUBCheck from <https://github.com/w3c/epubcheck/releases> (unzip it and put a wrapper
+named `epubcheck` on PATH) and uv from <https://docs.astral.sh/uv/>.
+
+## Scripts
+
+Run each script with `uv run --no-project` so uv provides lxml and rdflib without touching
+any project environment. `${CLAUDE_SKILL_DIR}` is the folder that holds this file; where it
+is not substituted, use the path of this skill's `scripts/` folder instead.
+
+| Script | Purpose |
+| --- | --- |
+| `epub_metadata.py BOOK [--json \| --summary \| --path NAME]` | Read metadata (as JSON-LD), version, archive paths, TOC, spine, manifest |
+| `epub_update.py BOOK -o OUT [options]` | Change metadata, the cover, or files; keeps manifest, spine, and navigation consistent |
+| `epub_upgrade.py BOOK -o OUT` | Convert EPUB 2 to EPUB 3 without rebuilding the content |
+
+All three accept `--json` for a machine-readable report. Pass `--help` for the full options.
+
+```bash
+S="${CLAUDE_SKILL_DIR}/scripts"
+uv run --no-project "$S/epub_metadata.py" book.epub --summary
+```
+
+## Inspect a book
+
+Start with the summary. It is small enough to read whole and tells you the version, the
+metadata, where the package, navigation, NCX, and cover files are inside the archive, and
+whether any file the package lists is missing:
+
+```bash
+uv run --no-project "$S/epub_metadata.py" book.epub --summary
+```
+
+Use `--json` only when the manifest, spine, or TOC are needed, and filter it with `jq`.
+Archive paths differ between producers (pandoc writes `EPUB/content.opf`, other tools
+`OEBPS/content.opf`), so never guess a path; ask the script, then read the file:
+
+```bash
+opf=$(uv run --no-project "$S/epub_metadata.py" book.epub --path opf) && unzip -p book.epub "$opf"
+nav=$(uv run --no-project "$S/epub_metadata.py" book.epub --path nav) && unzip -p book.epub "$nav"
+```
+
+`--path` exits 2 when the book has no such file (an EPUB 2 book has no nav document).
+`zipinfo -1 book.epub` lists every archive entry. To get the text of a book, convert it with
+pandoc: `pandoc book.epub -t markdown -o book.md` (also `-t plain`, `-t html`).
+
+## Create a book with pandoc
+
+Pandoc builds an EPUB 3 from Markdown, HTML, DOCX, LaTeX, or any other input it reads.
+Keep the metadata in a YAML file and pass it with `--metadata-file`: it is the only way to
+express lists (several authors or subjects) and identifiers with a scheme, and it avoids
+shell-quoting mistakes in titles and descriptions.
 
 ```yaml
----
+# metadata.yaml
 title: Book Title
 author:
   - First Author
   - Second Author
-date: 2026-01-01
+date: 2026-01-01          # ISO 8601; pandoc writes it to dc:date as given
 lang: en-US
 publisher: Publisher Name
 rights: All rights reserved
-subject:
-  - Fiction
-  - Adventure
+subject: [Fiction, Adventure]
 identifier:
   - scheme: ISBN
     text: 978-0-000-00000-0
 description: A brief description of the book.
----
 ```
 
-Pass it with `--metadata-file=metadata.yaml`. Pandoc adds the required
-`dcterms:modified` timestamp automatically.
-
-### 2. Validate an EPUB
-
-Use epubcheck to validate against the EPUB 3 specification:
-
 ```bash
-# Full validation (EPUB 3 by default)
-epubcheck book.epub
+pandoc input.md -t epub3 -o book.epub --metadata-file=metadata.yaml
 
-# Machine-readable JSON output for programmatic analysis
-epubcheck book.epub --json results.json
-
-# Validate with usage information (shows EPUB features used)
-epubcheck book.epub --usage
-
-# Fail on warnings too (stricter validation)
-epubcheck book.epub --failonwarnings
+# Several chapters, a cover, a stylesheet, and a nav document two levels deep
+pandoc ch01.md ch02.md ch03.md -t epub3 -o book.epub \
+  --metadata-file=metadata.yaml --epub-cover-image=cover.jpg --css=style.css \
+  --toc --toc-depth=2 --split-level=1 --top-level-division=chapter
 ```
 
-Always validate after creating or modifying an EPUB. When fixing validation errors, parse the
-output systematically — fix errors before warnings, and re-validate after each round of fixes.
+Pandoc 3.9 marks `--epub-chapter-level` as deprecated in favour of `--split-level`, which
+every pandoc 3 release accepts. Pandoc adds the `dcterms:modified` timestamp itself. For a
+book the user is writing, one Markdown file per chapter plus a metadata file is the
+arrangement that converts most cleanly.
 
-Common EPUB 3 validation issues:
+## Validate
 
-- **Missing `dcterms:modified`** — Add `<meta property="dcterms:modified">` to metadata
-- **Missing nav document** — Ensure an XHTML file with `properties="nav"` exists in the manifest
-- **Missing alt text** — Add `alt` attributes to all `<img>` tags
-- **Invalid XHTML5** — Ensure all tags are properly closed and content is well-formed XML
-- **Missing required metadata** — Add `dc:identifier`, `dc:title`, `dc:language` to the OPF
-
-### 3. Query EPUB Contents
-
-EPUBs are ZIP archives. Inspect them directly:
+Validate every EPUB after writing it. EPUBCheck exits 0 when there are no errors and 1 when
+there are; `--failonwarnings` makes warnings fail too. Read the message IDs: `RSC-005` is a
+schema violation in the file and line named, `RSC-007` a reference to a file that is not in
+the archive, `RSC-012` a link to a fragment that does not exist, `HTM-004` a non-HTML5
+DOCTYPE, `OPF-053` a date that is not ISO 8601.
 
 ```bash
-# List all files in the EPUB
-zipinfo -1 book.epub
-
-# Extract the OPF (package) file to read metadata and check EPUB version
-unzip -p book.epub OEBPS/content.opf 2>/dev/null || unzip -p book.epub content.opf 2>/dev/null
-
-# Extract the EPUB 3 navigation document
-unzip -p book.epub OEBPS/toc.xhtml 2>/dev/null
-
-# Extract a specific chapter
-unzip -p book.epub OEBPS/ch01.xhtml
+epubcheck book.epub                         # readable report
+epubcheck book.epub --json report.json      # structured report for larger books
+jq '.messages[] | select(.severity=="ERROR") | {ID, message, locations: [.locations[].path]}' report.json
 ```
 
-For structured metadata extraction (including version detection), use the helper script:
+Fix errors before warnings and validate again after each round. EPUBCheck checks
+conformance only: a book can pass and still have lost its styling or cover, so compare
+`epub_metadata.py --summary` output before and after a conversion as well.
+
+## Change metadata, cover, or files
+
+`epub_update.py` edits the package document in place of its structure, so the prefixes,
+comments, ids, and refinements already in the file survive. It requires `--output` and
+writes `dcterms:modified` as the current UTC time on every write (give `--modified` to set a
+specific timestamp). Dates must be ISO 8601 (`2026`, `2026-01`, or `2026-01-31`); anything
+else is rejected rather than written.
 
 ```bash
-uv run --no-project scripts/epub_metadata.py book.epub
+uv run --no-project "$S/epub_update.py" book.epub -o new.epub --title "New Title" --author "A. Writer"
+uv run --no-project "$S/epub_update.py" book.epub -o new.epub \
+  --subject History --subject Travel \
+  --set schema:accessibilitySummary="Text with structural navigation" \
+  --remove-meta dc:rights
+uv run --no-project "$S/epub_update.py" book.epub -o new.epub --cover cover.png
+uv run --no-project "$S/epub_update.py" book.epub -o new.epub --add notes.xhtml:EPUB/text/notes.xhtml
+uv run --no-project "$S/epub_update.py" book.epub -o new.epub --remove EPUB/text/old.xhtml
 ```
 
-The script reports the EPUB version, which is useful for identifying files that need conversion
-to EPUB 3. Add `--json` for machine-readable JSON-LD output with Dublin Core vocabulary (`dc:`
-and `dcterms:` terms):
+A plain `--author NAME` changes the name and keeps the author's role and sort form. Repeated
+flags set the whole list for that field, in order. `--set KEY=VALUE` takes any key the
+metadata JSON uses (`dc:source`, `dcterms:issued`, `schema:accessMode`, `a11y:certifiedBy`).
+`--cover` replaces the existing cover image, renaming it when the format changes and
+updating every reference to it; without an existing cover it adds one. `--add` lists the
+file in the manifest and puts an XHTML document at the end of the spine. `--remove` deletes
+the file and its manifest item, spine entry, nav and NCX links, and guide entries, and warns
+about any other document that still links to it.
+
+For larger edits, round-trip the metadata through a file. Every key present in the file is
+applied, keys absent from the file are left alone, and an empty list removes a key, so
+nothing disappears unless the file says so:
 
 ```bash
-# Full output (metadata, manifest, spine, TOC, file list)
-uv run --no-project scripts/epub_metadata.py book.epub --json
-
-# Concise summary (metadata + version only) — prefer this to manage context window
-uv run --no-project "$SKILL_DIR/epub_metadata.py" book.epub --json \
-  | jq '{metadata, version, toc_type, file_count}'
-
-# Full output to file for round-trip editing
-uv run --no-project "$SKILL_DIR/epub_metadata.py" book.epub --json > metadata.json
+uv run --no-project "$S/epub_metadata.py" book.epub --summary > meta.json
+# edit meta.json: change "metadata"."dc:title", add "dc:contributor", set "dc:subject": [] ...
+uv run --no-project "$S/epub_update.py" book.epub -o new.epub --metadata-file meta.json
 ```
 
-Prefer `jq` filtering or file redirect over raw `--json` output to keep the context window
-manageable. The full output includes manifest, spine, and file list which are rarely needed
-for metadata operations.
+In that JSON, a value with refinements is an object with `rdf:value` plus one key per
+refinement (`epub:role`, `epub:file-as`, `epub:identifier-type`); a refinement that has a
+scheme is itself an object with `rdf:value` and `opf:scheme`. EPUB 2 attributes appear as
+`opf:role`, `opf:file-as`, `opf:scheme`, and `opf:event`, and go back as attributes on an
+EPUB 2 package or as refinements on an EPUB 3 package. Flags override values from the file.
 
-Use pandoc to convert an EPUB back to readable text:
+## Upgrade EPUB 2 to EPUB 3
+
+Check the version first (`--summary` reports it). For a `2.0` package, use the upgrade
+script. It keeps every content file, stylesheet, image, and file name, and changes only what
+EPUB 3 requires: the package version, the EPUB 2 `opf:` attributes (converted to
+refinements), empty metadata elements (removed), `dcterms:modified` (added), the cover item
+(marked `cover-image`), a navigation document (generated from the NCX, with landmarks from
+the guide), and in each XHTML file the DOCTYPE and any HTML named entities that XML does not
+define.
 
 ```bash
-# Extract as Markdown
-pandoc book.epub -t markdown -o output.md
-
-# Extract as plain text
-pandoc book.epub -t plain -o output.txt
-
-# Extract as HTML
-pandoc book.epub -t html -o output.html
+uv run --no-project "$S/epub_upgrade.py" old.epub -o new.epub && epubcheck new.epub
 ```
 
-### 4. Update an EPUB
+The report lists each change and anything it had to drop. EPUBCheck then reports whatever
+the content itself has that EPUB 3 forbids (presentational attributes such as `align`,
+`<center>`, or `<font>`); fix those in the XHTML with `--remove`/`--add` or by extracting,
+editing, and repacking (see the reference file for the packing rules).
 
-EPUBs can be modified by extracting, editing, and repackaging:
+Converting with pandoc (`pandoc old.epub -t epub3 -o new.epub`) is a different operation: it
+rebuilds the book from pandoc's document model, which drops the publisher's CSS classes and
+cover markup, renames every file, and may insert a title page. Use it only when the user
+wants a reflowed book rather than their book upgraded. Pandoc also ignores `--metadata-file`
+when the input is an EPUB, so change metadata afterwards with `epub_update.py`. Pandoc keeps
+a `dc:date` that is `YYYY` or `YYYY-MM-DD` and blanks any other form (a month name, a full
+timestamp), which EPUBCheck rejects; set a valid ISO date with `--date` afterwards.
 
-```bash
-# Use the helper script for metadata updates
-python3 scripts/epub_update.py book.epub --title "New Title" --author "New Author"
-
-# Round-trip: extract metadata as JSON-LD, edit, and apply back
-uv run --no-project scripts/epub_metadata.py book.epub --json > meta.json
-# ... edit meta.json ...
-python3 scripts/epub_update.py book.epub --metadata-file meta.json
-
-# CLI flags override file values
-python3 scripts/epub_update.py book.epub --metadata-file meta.json --title "Override Title"
-
-# Manual approach: extract, edit, repack
-mkdir -p epub_work && cd epub_work
-unzip ../book.epub
-# ... edit files ...
-# Repack (mimetype must be first, uncompressed)
-zip -X0 ../updated.epub mimetype
-zip -Xr9D ../updated.epub * -x mimetype
-```
-
-The repackaging order matters — `mimetype` must be the first entry and stored without compression.
-
-### 5. Convert To/From EPUB 3
-
-Use pandoc for format conversion. Always use `-t epub3` when outputting EPUB.
+## Convert to and from other formats
 
 ```bash
-# EPUB to other formats
-pandoc book.epub -o book.pdf
 pandoc book.epub -o book.docx
-pandoc book.epub -o book.html
-
-# Other formats to EPUB 3
-pandoc document.docx -t epub3 -o book.epub
-pandoc page.html -t epub3 -o book.epub
-pandoc paper.tex -t epub3 -o book.epub
+pandoc book.epub -o book.pdf          # needs a PDF engine such as LaTeX or wkhtmltopdf
+pandoc document.docx -t epub3 -o book.epub --metadata-file=metadata.yaml
 ```
 
-### 6. Convert EPUB 2 to EPUB 3
+## Accessibility metadata
 
-Pandoc reads EPUB 2 files natively and can output EPUB 3, handling the structural conversion
-automatically — upgrading the navigation from NCX to an XHTML nav document, converting content
-from XHTML 1.1 to XHTML5, and adding the required EPUB 3 metadata.
+EPUB 3 books sold in the European Union have needed accessibility metadata since June 2025
+(European Accessibility Act), and retailers increasingly require it. Pandoc writes basic
+`schema:accessMode`, `schema:accessibilityFeature`, and `schema:accessibilityHazard`
+values; add a human-readable `schema:accessibilitySummary` and, when the book has been
+checked, `dcterms:conformsTo` with the EPUB Accessibility conformance URL. Set them with
+`--set` or in the metadata file. EPUBCheck validates the syntax of these properties but not
+the book's accessibility; the DAISY Ace checker (`npm install -g @daisy/ace`) does that.
 
-```bash
-# Convert EPUB 2 to EPUB 3 (always work on a copy)
-pandoc old_book.epub -t epub3 -o new_book.epub
+## Working rules
 
-# Regenerate the EPUB 3 nav document from headings (useful if the original TOC is sparse)
-pandoc old_book.epub -t epub3 -o new_book.epub \
-  --toc --toc-depth=2
+- Scripts never modify a file in place, so the user's original is always kept; pass `-o`.
+- Validate with `epubcheck` after every write, and re-validate after each round of fixes.
+- Dates written to a book are ISO 8601.
+- Give pandoc metadata through `--metadata-file`, not `--metadata` flags.
+- For an EPUB 2 input, upgrade with `epub_upgrade.py`; reserve pandoc for reflowing.
+- When a command can fail quietly (an `unzip -p` of a guessed path, a `grep` that prints
+  nothing), check its exit status or use the script that reports paths and errors.
 
-# Override metadata when the input is an EPUB: do NOT pass metadata to pandoc.
-# Pandoc keeps the metadata embedded in an EPUB source — a --metadata-file is
-# ignored entirely, and inline --metadata only partially applies (title changes,
-# language does not). Convert the structure with pandoc first, then edit metadata
-# with epub_update.py, which rewrites the OPF directly.
-pandoc old_book.epub -t epub3 -o new_book.epub
-python3 scripts/epub_update.py new_book.epub --title "Updated Title" --language en-GB
-# epub_update.py also accepts --metadata-file for a saved set of fields (see Update).
-```
+## Reference
 
-After conversion, always validate the result:
-
-```bash
-epubcheck new_book.epub
-```
-
-If epubcheck reports errors, fix them and re-validate. Common post-conversion issues:
-
-- **Deprecated attributes** — Remove EPUB 2-era attributes that are not valid in EPUB 3
-  (e.g., `align` on elements — use CSS instead)
-- **NCX-only navigation** — Pandoc should generate the EPUB 3 nav document automatically,
-  but verify it exists in the output (`zipinfo -1 new_book.epub | grep -i nav`)
-- **Missing `dcterms:modified`** — Pandoc adds this, but if updating metadata manually,
-  ensure it is present
-- **Empty `<dc:date>`** — Converting from an EPUB can leave an empty `<dc:date>` element
-  (pandoc drops the source's date value), which epubcheck rejects as `RSC-005`. Set a valid
-  date — `python3 scripts/epub_update.py new_book.epub --date 2026-01-01` — or remove the
-  element entirely, since `dc:date` is optional in EPUB 3.
-
-For batch conversion of multiple files:
-
-```bash
-for f in *.epub; do
-  pandoc "$f" -t epub3 -o "epub3_${f}"
-  epubcheck "epub3_${f}"
-done
-```
-
-#### Detecting EPUB Version
-
-Before converting, check whether a file is already EPUB 3:
-
-```bash
-# Quick version check via the OPF package document
-unzip -p book.epub OEBPS/content.opf 2>/dev/null | grep -o 'version="[^"]*"'
-
-# Or use the metadata script for a full report
-uv run --no-project scripts/epub_metadata.py book.epub
-```
-
-If the version is `"3.0"` or higher, conversion is not needed — just validate with epubcheck.
-
-## Helper Scripts
-
-Two Python helper scripts are bundled in the `scripts/` directory of this skill.
-`epub_metadata.py` declares its `rdflib` dependency inline (PEP 723), so running it with
-`uv run` provisions `rdflib` automatically — no separate install. `epub_update.py` uses only
-the Python 3 standard library, so it runs under plain `python3`.
-
-- **`scripts/epub_metadata.py <file.epub> [--json]`** — Extract and display all metadata, TOC
-  structure, spine order, and manifest contents from an EPUB file. Reports the EPUB version.
-  With `--json`, outputs JSON-LD using Dublin Core vocabulary.
-- **`scripts/epub_update.py <file.epub> [options]`** — Modify EPUB metadata, replace the cover
-  image, or inject/remove files. Accepts `--metadata-file` for JSON-LD input (as produced by
-  `epub_metadata.py --json`). Run with `--help` for full usage.
-
-When running these scripts, use the full path relative to this skill's installation directory.
-Locate the skill directory first:
-
-```bash
-# Find the skill directory
-SKILL_DIR=$(find ~/.claude -path "*/skill-epub/scripts" -type d 2>/dev/null | head -1)
-# Run a script
-uv run --no-project "$SKILL_DIR/epub_metadata.py" book.epub
-```
-
-## EPUB Structure Reference
-
-Read `references/epub-structure.md` for detailed information about the EPUB 3 format internals,
-including the container layout, OPF package document, navigation documents, and content
-document requirements.
-
-## Workflow Guidelines
-
-- Always use `-t epub3` when creating or converting EPUBs with pandoc.
-- When creating or converting *into* EPUB from Markdown, HTML, etc., pass metadata to
-  pandoc through a `--metadata-file` (YAML), never inline `--metadata` flags — a file is
-  reusable and auditable, sidesteps shell-quoting issues, and is the only clean way to
-  express multi-valued fields (several authors or subjects) and an identifier with a scheme.
-  To change the metadata of an *existing* EPUB, use `epub_update.py` (which also takes a
-  `--metadata-file`); pandoc does not reliably override metadata embedded in an EPUB input.
-- Always validate after creating or modifying an EPUB with `epubcheck`.
-- When encountering an EPUB 2 file, convert it to EPUB 3 using pandoc before further processing.
-- When the user provides content to convert, prefer Markdown as the intermediate format —
-  pandoc handles it cleanly.
-- For multi-chapter books, recommend one Markdown file per chapter with a metadata YAML file.
-- When modifying an existing EPUB, always work on a copy — never modify the original in place.
-- If an EPUB fails validation, use `epubcheck book.epub --json results.json` for structured
-  error output, then fix issues systematically starting with errors before warnings.
+`references/epub-structure.md` describes the EPUB 3 container, package document, navigation
+document, content document requirements, media types, the EPUB 2 to EPUB 3 differences, and
+the ZIP packing rules for building an EPUB by hand.

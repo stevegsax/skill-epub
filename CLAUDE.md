@@ -4,51 +4,65 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A Claude Skill for EPUB file operations. `SKILL.md` is the skill definition (YAML frontmatter +
-workflow guides) that gets loaded into Claude's context. The two Python scripts in `scripts/` are
-helper tools invoked by the skill at runtime.
+A Claude Skill for EPUB file operations. `SKILL.md` is the skill definition (YAML frontmatter
+plus the workflow guide) that gets loaded into Claude's context. The Python scripts in
+`scripts/` are helper tools the skill runs at runtime.
 
-## Running the Scripts
+## Running the Scripts and Tests
 
 ```bash
-uv run --no-project scripts/epub_metadata.py book.epub        # human-readable output
-uv run --no-project scripts/epub_metadata.py book.epub --json # JSON-LD with Dublin Core vocabulary
-python3 scripts/epub_update.py book.epub --title "X" # modify metadata
-python3 scripts/epub_update.py book.epub --metadata-file meta.json  # apply JSON-LD metadata
+uv run --no-project scripts/epub_metadata.py book.epub --summary
+uv run --no-project scripts/epub_update.py book.epub -o new.epub --title "X"
+uv run --no-project scripts/epub_upgrade.py old.epub -o new.epub
+
+uv run --no-project --with pytest pytest tests          # tests (epubcheck optional)
+uvx ruff check scripts tests && uvx ruff format scripts tests
 ```
 
-`epub_metadata.py` declares its `rdflib` dependency inline (PEP 723), so `uv run` provisions
-it automatically — no separate install. `epub_update.py` uses only the standard library.
-
-External tools: `pandoc`, `epubcheck`, and `uv` (install via `brew install pandoc epubcheck uv`).
+Each script declares its dependencies inline (PEP 723: lxml for the editing scripts, rdflib
+for `epub_metadata.py`) and requires Python 3.10 or newer, so always run them through
+`uv run --no-project`, never plain `python3`. External tools: `pandoc`, `epubcheck`, `uv`.
 
 ## Architecture
 
-- **`SKILL.md`** — Skill definition loaded by Claude. Frontmatter defines trigger phrases and
-  allowed tools. Body contains workflow guides for EPUB operations.
-- **`scripts/epub_metadata.py`** — Extracts metadata, TOC, spine, manifest from an EPUB.
-  Outputs JSON-LD (Dublin Core `dc:`/`dcterms:` vocabulary) or human-readable text.
-- **`scripts/epub_update.py`** — Modifies EPUB metadata, cover images, and internal files.
-  Accepts JSON-LD input from `epub_metadata.py --json` for round-tripping.
-- **`references/epub-structure.md`** — EPUB 3 format specification reference.
+- `SKILL.md`: skill definition. Frontmatter follows the Agent Skills specification (`name`,
+  `description`, `compatibility`, `allowed-tools`); scripts are referenced through
+  `${CLAUDE_SKILL_DIR}`. Keep the body under 500 lines.
+- `scripts/epub_common.py`: helpers with no third-party dependencies: namespaces, container
+  parsing, href resolution, ISO date checks, and `write_epub()` (mimetype first and stored,
+  temp file renamed into place, never overwrites the input).
+- `scripts/epub_opf.py`: lxml editing of the package document and navigation files. All
+  metadata, manifest, spine, cover, reference-rewriting, and nav-generation logic lives here
+  and is shared by the two editing scripts.
+- `scripts/epub_metadata.py`: read-only. Builds an RDF graph with rdflib and serializes it
+  as JSON-LD; `--summary`, `--json`, `--path`.
+- `scripts/epub_update.py`: metadata, cover, add and remove files. `--output` required.
+- `scripts/epub_upgrade.py`: EPUB 2 to EPUB 3 while keeping the content files.
+- `references/epub-structure.md`: EPUB 3.3 reference the skill points Claude to.
+- `tests/`: pytest suite; `fixtures.py` builds valid EPUB 2 and EPUB 3 books from strings.
 
 ## Key Implementation Patterns
 
-**JSON-LD metadata round-trip**: `epub_metadata.py --json` uses rdflib to build a proper RDF
-graph from OPF metadata and serializes it as JSON-LD. DC elements with `<meta refines="#id">`
-become structured nodes (BNodes with `rdf:value` + refinement predicates like `epub:role`).
-Non-refining `<meta property>` elements (e.g., `schema:accessMode`, `dcterms:modified`) become
-direct predicates on the publication node. `epub_update.py --metadata-file` reads that format
-back, using `_extract_rdf_value()` to handle both simple literals and structured BNode objects
-when mapping `dc:*` keys to CLI field names.
+**JSON-LD metadata round-trip.** A refined element is an object with `rdf:value` and one key
+per refinement; a refinement with a scheme is an object with `rdf:value` and `opf:scheme`.
+EPUB 2 attributes are `opf:role`, `opf:file-as`, `opf:scheme`, `opf:event`. The `epub:`
+prefix is the unprefixed package meta vocabulary (`http://idpf.org/epub/vocab/package/meta/#`);
+`schema:` is `http://schema.org/` and `marc:` is `http://id.loc.gov/vocabulary/`, matching
+EPUBCheck. `epub_opf.apply_metadata()` applies every key present, leaves absent keys alone,
+and treats an empty list as removal. A plain string value changes text only and keeps the
+element's refinements; a dict replaces the node.
 
-**XML namespace handling**: Both scripts define an `NS` dict mapping prefixes to URIs.
-`epub_update.py` registers namespaces via `ET.register_namespace()` so prefixes survive
-serialization. The OPF default namespace is registered as `""` (not `"opf"`).
+**lxml, not ElementTree, for writing.** ElementTree drops the `opf:` prefix from attributes
+and discards comments, which breaks EPUB 2 packages. `epub_opf.dump_opf()` keeps the source
+prefixes and declares `dc:`/`opf:` at the root through `cleanup_namespaces`.
 
-**EPUB ZIP repackaging**: EPUBs require `mimetype` as the first entry, stored uncompressed
-(`ZIP_STORED`). `epub_update.py` writes to a temp file first, then moves to the output path
-on success.
+**Nothing is edited in place.** `check_output_path()` refuses an output equal to the input;
+`write_epub()` writes a temp file and renames it. `dcterms:modified` is set to the current
+UTC time on every EPUB 3 write unless `--modified` is given; dates are validated as ISO 8601.
 
-**EPUB 2 vs 3 navigation**: `epub_metadata.py` tries EPUB 3 nav document first (manifest item
-with `properties="nav"`), falls back to NCX (`application/x-dtbncx+xml` media type).
+**Manifest stays consistent.** `--add` creates the manifest item (and spine entry for XHTML);
+`--remove` drops the item, spine entry, nav and NCX links, and guide references, and warns
+about remaining references; a cover rename rewrites `src`/`href`/`url()` references.
+
+**Validation in tests.** `assert_valid()` runs EPUBCheck when available and expects
+`0 errors / 0 warnings`; new behaviour that writes a file should be covered by such a test.
