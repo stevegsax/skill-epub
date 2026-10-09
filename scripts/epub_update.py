@@ -1,416 +1,372 @@
 #!/usr/bin/env python3
-"""Modify EPUB metadata, cover image, or internal files.
+"""Modify EPUB metadata, cover image, or internal files, writing a new file.
 
 Usage:
-    python3 epub_update.py <file.epub> [options]
+    uv run --no-project epub_update.py <in.epub> --output <out.epub> [options]
 
-Options:
-    --title TEXT          Set the book title
-    --author TEXT         Set the book author (repeatable)
-    --language TEXT       Set the language code (e.g., en-US)
-    --description TEXT    Set the book description
-    --publisher TEXT      Set the publisher
-    --date TEXT           Set the publication date
-    --identifier TEXT     Set the unique identifier
-    --rights TEXT         Set the rights statement
-    --metadata-file FILE Load metadata from a JSON-LD file (as produced by epub_metadata.py --json)
-    --cover IMAGE        Replace the cover image
-    --add FILE:PATH      Add a file to the EPUB at the given internal path
-    --remove PATH        Remove a file from the EPUB by internal path
-    --output FILE        Output path (default: overwrites input)
-    --dry-run            Show what would change without modifying the file
+Metadata options (each sets the whole value of that field):
+    --title TEXT              dc:title
+    --author TEXT             dc:creator (repeatable, in order)
+    --contributor TEXT        dc:contributor (repeatable)
+    --subject TEXT            dc:subject (repeatable)
+    --language TEXT           dc:language (BCP 47 tag, e.g. en-US)
+    --description TEXT        dc:description
+    --publisher TEXT          dc:publisher
+    --date TEXT               dc:date (ISO 8601: 2026, 2026-01, or 2026-01-31)
+    --identifier TEXT         dc:identifier named by unique-identifier
+    --rights TEXT             dc:rights
+    --set KEY=VALUE           any key, e.g. dc:source=... or
+                              schema:accessibilitySummary=... (repeatable)
+    --remove-meta KEY         remove every element for KEY (repeatable)
+    --metadata-file FILE      JSON-LD from epub_metadata.py --json/--summary;
+                              every key present is applied, keys absent are
+                              left alone, an empty list removes a key
+    --modified TIMESTAMP      dcterms:modified value; default: now, UTC
 
-No external dependencies — uses only the Python 3 standard library.
-Note: epub_metadata.py (which produces the JSON-LD input) requires rdflib.
+File options:
+    --cover IMAGE             replace (or add) the cover image
+    --add FILE:PATH           add a local file at an archive path; it is
+                              listed in the manifest, and XHTML goes to the
+                              end of the spine
+    --remove PATH             remove an archive path, its manifest item,
+                              spine entry, and navigation links
+
+Other:
+    --output, -o FILE         required unless --dry-run; never the input
+    --dry-run                 report the changes without writing
+    --json                    report as JSON on stdout
+
+dcterms:modified is set to the current UTC time whenever an EPUB 3 file is
+written, unless --modified gives a value. Dependencies (lxml) are declared
+below (PEP 723), so `uv run` provisions them.
 """
+
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["lxml>=5"]
+# ///
+
+from __future__ import annotations
 
 import argparse
 import json
-import mimetypes
 import os
-import shutil
+import posixpath
 import sys
-import tempfile
-import xml.etree.ElementTree as ET
 import zipfile
-from pathlib import PurePosixPath
 
+import epub_opf as opf
+from epub_common import (
+    EpubError,
+    check_output_path,
+    find_opf_path,
+    guess_media_type,
+    is_iso_date,
+    is_modified_timestamp,
+    now_utc_iso,
+    opf_dir,
+    relative_href,
+    write_epub,
+)
+from lxml import etree
 
-NS = {
-    "container": "urn:oasis:names:tc:opendocument:xmlns:container",
-    "opf": "http://www.idpf.org/2007/opf",
-    "dc": "http://purl.org/dc/elements/1.1/",
+CLI_FIELDS = {
+    "title": "dc:title",
+    "author": "dc:creator",
+    "contributor": "dc:contributor",
+    "subject": "dc:subject",
+    "language": "dc:language",
+    "description": "dc:description",
+    "publisher": "dc:publisher",
+    "date": "dc:date",
+    "identifier": "dc:identifier",
+    "rights": "dc:rights",
 }
-
-# Register namespaces so they're preserved in output
-for prefix, uri in NS.items():
-    ET.register_namespace(prefix if prefix != "opf" else "", uri)
-ET.register_namespace("dcterms", "http://purl.org/dc/terms/")
-
-
-def find_opf_path(zf: zipfile.ZipFile) -> str:
-    """Locate the OPF file path from META-INF/container.xml."""
-    container_xml = zf.read("META-INF/container.xml")
-    root = ET.fromstring(container_xml)
-    rootfile = root.find(".//container:rootfile", NS)
-    if rootfile is None:
-        raise ValueError("No rootfile found in container.xml")
-    return rootfile.attrib["full-path"]
-
-
-def set_dc_element(metadata: ET.Element, tag: str, values: list[str]):
-    """Set a Dublin Core metadata element, preserving attributes on existing ones.
-
-    Updates existing elements in-place so that id attributes and associated
-    <meta refines="..."> relationships survive. Only adds new elements when
-    there are more values than existing elements. Removes surplus elements
-    and cleans up any orphaned <meta refines="..."> that referenced them.
-    """
-    full_tag = f"{{{NS['dc']}}}{tag}"
-    existing = metadata.findall(f"dc:{tag}", NS)
-
-    # Update existing elements in-place (preserves id and other attributes)
-    for i, value in enumerate(values):
-        if i < len(existing):
-            existing[i].text = value
-        else:
-            el = ET.SubElement(metadata, full_tag)
-            el.text = value
-
-    # Remove surplus existing elements and their associated refines
-    for el in existing[len(values):]:
-        el_id = el.get("id")
-        if el_id:
-            for meta in metadata.findall("opf:meta", NS):
-                if meta.get("refines") == f"#{el_id}":
-                    metadata.remove(meta)
-        metadata.remove(el)
-
-
-def _extract_rdf_value(val):
-    """Extract plain values from JSON-LD nodes.
-
-    Handles strings (pass through), dicts (extract rdf:value or @value),
-    and lists (map recursively).
-    """
-    if isinstance(val, str):
-        return val
-    if isinstance(val, dict):
-        return val.get("rdf:value", val.get("@value", str(val)))
-    if isinstance(val, list):
-        return [_extract_rdf_value(v) for v in val]
-    return val
 
 
 def load_metadata_file(path: str) -> dict:
-    """Load metadata from a JSON-LD file produced by epub_metadata.py.
-
-    Handles both simple literal values and structured BNode objects
-    (dicts with rdf:value). Returns a dict with CLI-compatible field
-    names and optionally a 'dcterms:modified' key for the OPF meta element.
-    """
-    with open(path) as f:
+    """Read a JSON-LD metadata object (or a full epub_metadata.py JSON dump)."""
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
-
-    meta = data.get("metadata", data)
-
-    dc_to_cli = {
-        "dc:title": "title",
-        "dc:creator": "author",
-        "dc:language": "language",
-        "dc:description": "description",
-        "dc:publisher": "publisher",
-        "dc:date": "date",
-        "dc:identifier": "identifier",
-        "dc:rights": "rights",
-    }
-
-    result = {}
-    for dc_key, cli_key in dc_to_cli.items():
-        if dc_key in meta:
-            result[cli_key] = _extract_rdf_value(meta[dc_key])
-
-    if "dcterms:modified" in meta:
-        result["dcterms:modified"] = _extract_rdf_value(meta["dcterms:modified"])
-
-    return result
+    meta = data.get("metadata", data) if isinstance(data, dict) else None
+    if not isinstance(meta, dict):
+        raise EpubError(f"{path}: expected a JSON object with metadata keys")
+    return {k: v for k, v in meta.items() if not k.startswith("@")}
 
 
-def update_metadata(opf_root: ET.Element, updates: dict) -> list[str]:
-    """Apply metadata updates to the OPF document. Returns list of changes made."""
-    metadata = opf_root.find("opf:metadata", NS)
-    if metadata is None:
-        raise ValueError("No metadata element found in OPF")
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Modify EPUB metadata, cover image, or files.")
+    p.add_argument("epub", help="Path to the input EPUB file")
+    p.add_argument("--output", "-o", help="Output path (required unless --dry-run)")
+    p.add_argument("--dry-run", action="store_true", help="Report changes without writing")
+    p.add_argument("--json", action="store_true", help="Report as JSON")
 
-    changes = []
-    dc_field_map = {
-        "title": "title",
-        "author": "creator",
-        "language": "language",
-        "description": "description",
-        "publisher": "publisher",
-        "date": "date",
-        "identifier": "identifier",
-        "rights": "rights",
-    }
-
-    for key, dc_tag in dc_field_map.items():
-        if key in updates and updates[key] is not None:
-            values = updates[key] if isinstance(updates[key], list) else [updates[key]]
-            set_dc_element(metadata, dc_tag, values)
-            changes.append(f"Set {key}: {', '.join(values)}")
-
-    # Handle dcterms:modified meta element
-    if "dcterms:modified" in updates:
-        modified_value = updates["dcterms:modified"]
-        found = False
-        for meta in metadata.findall("opf:meta", NS):
-            if meta.get("property") == "dcterms:modified":
-                meta.text = modified_value
-                found = True
-                break
-        if not found:
-            meta_el = ET.SubElement(metadata, f"{{{NS['opf']}}}meta")
-            meta_el.set("property", "dcterms:modified")
-            meta_el.text = modified_value
-        changes.append(f"Set dcterms:modified: {modified_value}")
-
-    return changes
-
-
-def find_cover_item(opf_root: ET.Element) -> tuple[str | None, str | None]:
-    """Find the cover image item ID and href in the manifest."""
-    metadata = opf_root.find("opf:metadata", NS)
-    manifest = opf_root.find("opf:manifest", NS)
-    if metadata is None or manifest is None:
-        return None, None
-
-    # Check for meta name="cover" content="item-id" (EPUB 2)
-    for meta in metadata.findall("opf:meta", NS):
-        if meta.get("name") == "cover":
-            cover_id = meta.get("content")
-            if cover_id:
-                for item in manifest.findall("opf:item", NS):
-                    if item.get("id") == cover_id:
-                        return cover_id, item.get("href")
-
-    # Check for item with properties="cover-image" (EPUB 3)
-    for item in manifest.findall("opf:item", NS):
-        if "cover-image" in item.get("properties", ""):
-            return item.get("id"), item.get("href")
-
-    return None, None
-
-
-def replace_cover(opf_root: ET.Element, opf_path: str,
-                  cover_path: str) -> tuple[list[str], dict[str, bytes]]:
-    """Replace the cover image. Returns changes list and files to add."""
-    changes = []
-    files_to_add = {}
-
-    cover_id, cover_href = find_cover_item(opf_root)
-    opf_dir = str(PurePosixPath(opf_path).parent)
-
-    # Determine the media type of the new cover
-    mime_type, _ = mimetypes.guess_type(cover_path)
-    if not mime_type or not mime_type.startswith("image/"):
-        raise ValueError(f"Cover file does not appear to be an image: {cover_path}")
-
-    with open(cover_path, "rb") as f:
-        cover_data = f.read()
-
-    if cover_href:
-        # Replace existing cover
-        full_cover_path = str(PurePosixPath(opf_dir) / cover_href) if opf_dir != "." else cover_href
-        files_to_add[full_cover_path] = cover_data
-
-        # Update media-type if it changed
-        manifest = opf_root.find("opf:manifest", NS)
-        if manifest is None:
-            raise ValueError("No manifest element found in OPF")
-        for item in manifest.findall("opf:item", NS):
-            if item.get("id") == cover_id:
-                item.set("media-type", mime_type)
-        changes.append(f"Replaced cover image: {full_cover_path}")
-    else:
-        # Add new cover image
-        ext = os.path.splitext(cover_path)[1]
-        new_href = f"images/cover{ext}"
-        full_new_path = str(PurePosixPath(opf_dir) / new_href) if opf_dir != "." else new_href
-        files_to_add[full_new_path] = cover_data
-
-        # Add to manifest
-        manifest = opf_root.find("opf:manifest", NS)
-        if manifest is None:
-            raise ValueError("No manifest element found in OPF")
-        new_item = ET.SubElement(manifest, f"{{{NS['opf']}}}item")
-        new_item.set("id", "cover-image")
-        new_item.set("href", new_href)
-        new_item.set("media-type", mime_type)
-        new_item.set("properties", "cover-image")
-
-        # Add meta element for EPUB 2 compatibility
-        metadata = opf_root.find("opf:metadata", NS)
-        if metadata is None:
-            raise ValueError("No metadata element found in OPF")
-        meta = ET.SubElement(metadata, f"{{{NS['opf']}}}meta")
-        meta.set("name", "cover")
-        meta.set("content", "cover-image")
-
-        changes.append(f"Added cover image: {full_new_path}")
-
-    return changes, files_to_add
-
-
-def repackage_epub(input_path: str, output_path: str, opf_path: str,
-                   opf_root: ET.Element, files_to_add: dict[str, bytes],
-                   files_to_remove: set[str]):
-    """Repackage the EPUB with modifications."""
-    with tempfile.NamedTemporaryFile(suffix=".epub", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        with zipfile.ZipFile(input_path, "r") as zf_in:
-            with zipfile.ZipFile(tmp_path, "w") as zf_out:
-                # Write mimetype first, uncompressed
-                if "mimetype" in zf_in.namelist():
-                    zf_out.writestr("mimetype", zf_in.read("mimetype"),
-                                    compress_type=zipfile.ZIP_STORED)
-
-                # Copy existing files (except those being replaced/removed)
-                replaced_paths = set(files_to_add.keys()) | files_to_remove | {opf_path, "mimetype"}
-                for item in zf_in.infolist():
-                    if item.filename not in replaced_paths:
-                        zf_out.writestr(item, zf_in.read(item.filename))
-
-                # Write modified OPF
-                opf_bytes = ET.tostring(opf_root, encoding="unicode", xml_declaration=True)
-                zf_out.writestr(opf_path, opf_bytes)
-
-                # Write new/replaced files
-                for path, data in files_to_add.items():
-                    zf_out.writestr(path, data)
-
-        # Move temp file to output
-        shutil.move(tmp_path, output_path)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Modify EPUB metadata, cover image, or internal files.",
+    m = p.add_argument_group("metadata")
+    m.add_argument("--title")
+    m.add_argument("--author", action="append")
+    m.add_argument("--contributor", action="append")
+    m.add_argument("--subject", action="append")
+    m.add_argument("--language")
+    m.add_argument("--description")
+    m.add_argument("--publisher")
+    m.add_argument("--date")
+    m.add_argument("--identifier")
+    m.add_argument("--rights")
+    m.add_argument(
+        "--set",
+        action="append",
+        metavar="KEY=VALUE",
+        help="Set any metadata key, e.g. schema:accessibilitySummary=...",
     )
-    parser.add_argument("epub", help="Path to the EPUB file")
-    parser.add_argument("--title", help="Set the book title")
-    parser.add_argument("--author", action="append", help="Set author (repeatable)")
-    parser.add_argument("--language", help="Set language code")
-    parser.add_argument("--description", help="Set description")
-    parser.add_argument("--publisher", help="Set publisher")
-    parser.add_argument("--date", help="Set publication date")
-    parser.add_argument("--identifier", help="Set unique identifier")
-    parser.add_argument("--rights", help="Set rights statement")
-    parser.add_argument("--metadata-file",
-                        help="JSON-LD metadata file (as produced by epub_metadata.py --json)")
-    parser.add_argument("--cover", help="Replace cover image with this file")
-    parser.add_argument("--add", action="append", metavar="FILE:PATH",
-                        help="Add a file at the given internal path")
-    parser.add_argument("--remove", action="append", metavar="PATH",
-                        help="Remove a file by internal path")
-    parser.add_argument("--output", "-o", help="Output path (default: overwrites input)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show changes without modifying")
-    return parser.parse_args()
+    m.add_argument(
+        "--remove-meta",
+        action="append",
+        metavar="KEY",
+        help="Remove every element for a metadata key, e.g. dc:subject",
+    )
+    m.add_argument("--metadata-file", help="JSON-LD metadata to apply")
+    m.add_argument("--modified", help="dcterms:modified value (default: now, UTC)")
+
+    f = p.add_argument_group("files")
+    f.add_argument("--cover", help="Replace or add the cover image")
+    f.add_argument(
+        "--add", action="append", metavar="FILE:PATH", help="Add a local file at an archive path"
+    )
+    f.add_argument(
+        "--remove",
+        action="append",
+        metavar="PATH",
+        help="Remove an archive path and the package entries for it",
+    )
+    args = p.parse_args(argv)
+    if not args.dry_run and not args.output:
+        p.error("--output is required (the input file is never modified in place)")
+    return args
 
 
-def main():
-    args = parse_args()
-    epub_path = args.epub
-    output_path = args.output or epub_path
+def collect_metadata_updates(args) -> dict:
+    """Merge --metadata-file with CLI flags; flags win. Returns key → value(s)."""
+    updates: dict = {}
+    if args.metadata_file:
+        updates.update(load_metadata_file(args.metadata_file))
+        # dcterms:modified from the file would preserve a stale timestamp.
+        updates.pop("dcterms:modified", None)
+    for flag, key in CLI_FIELDS.items():
+        val = getattr(args, flag)
+        if val is not None:
+            updates[key] = val
+    for spec in args.set or []:
+        if "=" not in spec:
+            raise EpubError(f"--set needs KEY=VALUE, got {spec!r}")
+        key, value = spec.split("=", 1)
+        key = key.strip()
+        if key in updates and isinstance(updates[key], list):
+            updates[key].append(value)
+        elif key in updates:
+            updates[key] = [updates[key], value]
+        else:
+            updates[key] = value
+    for key in args.remove_meta or []:
+        updates[key] = []
+    if "dc:date" in updates:
+        for v in (
+            updates["dc:date"] if isinstance(updates["dc:date"], list) else [updates["dc:date"]]
+        ):
+            if not is_iso_date(opf.node_text(v)):
+                raise EpubError(f"--date must be ISO 8601 (2026, 2026-01, 2026-01-31), got {v!r}")
+    return updates
 
-    if not os.path.isfile(epub_path):
-        print(f"Error: File not found: {epub_path}", file=sys.stderr)
-        sys.exit(1)
+
+def run(args) -> dict:
+    report: dict = {
+        "input": args.epub,
+        "output": args.output,
+        "changes": [],
+        "warnings": [],
+        "notes": [],
+    }
+    changes, warnings, notes = report["changes"], report["warnings"], report["notes"]
+
+    if not os.path.isfile(args.epub):
+        raise EpubError(f"file not found: {args.epub}")
+    if args.output:
+        check_output_path(args.epub, args.output)
+    if args.modified and not is_modified_timestamp(args.modified):
+        raise EpubError(f"--modified must look like 2026-01-31T12:00:00Z, got {args.modified!r}")
 
     try:
-        zf = zipfile.ZipFile(epub_path, "r")
+        zf = zipfile.ZipFile(args.epub, "r")
     except zipfile.BadZipFile:
-        print(f"Error: Not a valid ZIP/EPUB file: {epub_path}", file=sys.stderr)
-        sys.exit(1)
+        raise EpubError(f"not a ZIP/EPUB file: {args.epub}") from None
 
     with zf:
+        names = set(zf.namelist())
         opf_path = find_opf_path(zf)
-        opf_xml = zf.read(opf_path)
-        opf_root = ET.fromstring(opf_xml)
+        base = opf_dir(opf_path)
+        try:
+            root = opf.load_opf(zf.read(opf_path))
+        except EpubError as e:
+            raise EpubError(f"{opf_path}: {e}") from None
+        files_to_add: dict[str, bytes] = {}
+        files_to_remove: set[str] = set()
 
-        all_changes = []
-        files_to_add = {}
-        files_to_remove = set()
+        # --- metadata ------------------------------------------------------
+        updates = collect_metadata_updates(args)
+        if updates:
+            changes += opf.apply_metadata(root, updates)
 
-        # Load metadata from JSON-LD file if provided
-        file_meta = {}
-        if args.metadata_file:
-            file_meta = load_metadata_file(args.metadata_file)
-
-        # Metadata updates: file values first, CLI flags override
-        meta_updates = dict(file_meta)
-        for k in ["title", "author", "language", "description",
-                   "publisher", "date", "identifier", "rights"]:
-            cli_val = getattr(args, k)
-            if cli_val is not None:
-                meta_updates[k] = cli_val
-        if meta_updates:
-            all_changes.extend(update_metadata(opf_root, meta_updates))
-
-        # Cover replacement
+        # --- cover ---------------------------------------------------------
         if args.cover:
-            cover_changes, cover_files = replace_cover(
-                opf_root, opf_path, args.cover
-            )
-            all_changes.extend(cover_changes)
-            files_to_add.update(cover_files)
+            if not os.path.isfile(args.cover):
+                raise EpubError(f"cover file not found: {args.cover}")
+            media_type = guess_media_type(args.cover)
+            if not media_type or not media_type.startswith("image/"):
+                raise EpubError(f"cover does not look like an image: {args.cover}")
+            with open(args.cover, "rb") as fh:
+                data = fh.read()
+            ext = posixpath.splitext(args.cover)[1].lower()
+            item = opf.find_cover_item(root)
+            if item is not None:
+                old_path = opf.item_path(root, base, item)
+                new_path = old_path
+                if posixpath.splitext(old_path)[1].lower() != ext:
+                    new_path = posixpath.splitext(old_path)[0] + ext
+                    if new_path in names:
+                        raise EpubError(f"cannot rename cover to {new_path}: that file exists")
+                    item.set("href", relative_href(base, new_path))
+                    files_to_remove.add(old_path)
+                    rewritten = opf.rewrite_references(root, base, zf, old_path, new_path)
+                    files_to_add.update(rewritten)
+                    for doc in rewritten:
+                        changes.append(f"Updated references to the cover in {doc}")
+                    changes.append(f"Renamed cover {old_path} -> {new_path}")
+                item.set("media-type", media_type)
+                files_to_add[new_path] = data
+                changes.append(f"Replaced cover image {new_path} ({media_type})")
+            else:
+                new_path = (
+                    posixpath.join(base, f"images/cover{ext}") if base else f"images/cover{ext}"
+                )
+                if new_path in names:
+                    raise EpubError(f"cannot add cover at {new_path}: that file exists")
+                item = opf.add_manifest_item(root, base, new_path, media_type, "cover-image")
+                files_to_add[new_path] = data
+                changes.append(f"Added cover image {new_path} ({media_type})")
+            changes += opf.set_cover_marker(root, item)
+            notes.append("A cover image only is set; no cover XHTML page was created or changed.")
 
-        # File additions
-        if args.add:
-            for add_spec in args.add:
-                if ":" not in add_spec:
-                    print(f"Error: --add requires FILE:PATH format, got: {add_spec}",
-                          file=sys.stderr)
-                    sys.exit(1)
-                local_file, internal_path = add_spec.split(":", 1)
-                if not os.path.isfile(local_file):
-                    print(f"Error: File not found: {local_file}", file=sys.stderr)
-                    sys.exit(1)
-                with open(local_file, "rb") as f:
-                    files_to_add[internal_path] = f.read()
-                all_changes.append(f"Added file: {internal_path}")
+        # --- add files -----------------------------------------------------
+        for spec in args.add or []:
+            if ":" not in spec:
+                raise EpubError(f"--add needs FILE:PATH, got {spec!r}")
+            local, path = spec.rsplit(":", 1)
+            if not os.path.isfile(local):
+                raise EpubError(f"file not found: {local}")
+            path = posixpath.normpath(path)
+            if path in names or path in files_to_add:
+                raise EpubError(
+                    f"{path} already exists in the EPUB; use --remove first to replace it"
+                )
+            media_type = guess_media_type(path)
+            if not media_type:
+                raise EpubError(
+                    f"cannot determine a media type for {path}; use a standard extension"
+                )
+            with open(local, "rb") as fh:
+                files_to_add[path] = fh.read()
+            item = opf.add_manifest_item(root, base, path, media_type)
+            changes.append(f"Added {path} as manifest item {item.get('id')} ({media_type})")
+            if media_type == "application/xhtml+xml":
+                opf.add_spine_item(root, item.get("id"))
+                changes.append(f"Appended {item.get('id')} to the end of the spine")
+                notes.append(
+                    f"{path} is last in the reading order and is not in the table of contents."
+                )
 
-        # File removals
-        if args.remove:
-            for path in args.remove:
-                files_to_remove.add(path)
-                all_changes.append(f"Removed file: {path}")
+        # --- remove files --------------------------------------------------
+        for path in args.remove or []:
+            path = posixpath.normpath(path)
+            if path not in names:
+                raise EpubError(f"{path} is not in the EPUB")
+            if path in ("mimetype", "META-INF/container.xml", opf_path):
+                raise EpubError(f"refusing to remove {path}: the EPUB needs it")
+            item = opf.find_item_by_path(root, base, path)
+            if item is not None:
+                if item is opf.find_nav_item(root):
+                    raise EpubError("refusing to remove the navigation document")
+                changes += opf.remove_manifest_item(root, item)
+            else:
+                warnings.append(f"{path} was not listed in the manifest")
+            files_to_remove.add(path)
+            changes.append(f"Removed {path}")
 
-        if not all_changes:
-            print("No changes specified. Use --help for usage.", file=sys.stderr)
-            sys.exit(1)
+            nav_item = opf.find_nav_item(root)
+            if nav_item is not None:
+                nav_path = opf.item_path(root, base, nav_item)
+                if nav_path in names:
+                    src = files_to_add.get(nav_path) or zf.read(nav_path)
+                    new, n = opf.remove_nav_links(src, posixpath.dirname(nav_path), path)
+                    if n:
+                        files_to_add[nav_path] = new
+                        changes.append(f"Removed {n} link(s) to {path} from {nav_path}")
+            ncx_item = opf.find_ncx_item(root)
+            if ncx_item is not None:
+                ncx_path = opf.item_path(root, base, ncx_item)
+                if ncx_path in names:
+                    src = files_to_add.get(ncx_path) or zf.read(ncx_path)
+                    new, n = opf.remove_ncx_points(src, posixpath.dirname(ncx_path), path)
+                    if n:
+                        files_to_add[ncx_path] = new
+                        changes.append(f"Removed {n} navPoint(s) for {path} from {ncx_path}")
+            for doc, href in opf.find_references(
+                root, base, zf, path, exclude=files_to_remove, overlay=files_to_add
+            ):
+                warnings.append(f"{doc} still references {path} as {href!r}; edit it by hand")
 
-        # Report changes
-        print("Changes:")
-        for change in all_changes:
-            print(f"  - {change}")
+        if not changes:
+            raise EpubError("no changes requested; run with --help for the options")
 
-        if args.dry_run:
-            print("\n(dry run — no files modified)")
-            return
+        if opf.is_epub3(root):
+            stamp = args.modified or now_utc_iso()
+            changes += opf.set_modified(root, stamp)
+        elif args.modified:
+            warnings.append("--modified ignored: EPUB 2 packages have no dcterms:modified")
+        else:
+            notes.append("EPUB 2 package: no dcterms:modified to update; consider epub_upgrade.py")
 
-        # Apply changes
-        repackage_epub(epub_path, output_path, opf_path, opf_root,
-                       files_to_add, files_to_remove)
-        print(f"\nWritten to: {output_path}")
+        files_to_add[opf_path] = opf.dump_opf(root)
+        if not args.dry_run:
+            write_epub(args.epub, args.output, files_to_add, files_to_remove)
+    return report
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    try:
+        report = run(args)
+    except (EpubError, etree.XMLSyntaxError) as e:
+        if args.json:
+            print(json.dumps({"error": str(e)}, indent=2))
+        else:
+            print(f"Error: {e}", file=sys.stderr)
+        return 1
+    report["dry_run"] = args.dry_run
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+    print("Changes:")
+    for c in report["changes"]:
+        print(f"  - {c}")
+    for w in report["warnings"]:
+        print(f"Warning: {w}")
+    for n in report["notes"]:
+        print(f"Note: {n}")
+    if args.dry_run:
+        print("\n(dry run: nothing written)")
+    else:
+        print(f"\nWritten to: {args.output}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
