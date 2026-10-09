@@ -1,5 +1,5 @@
 ---
-name: epub
+name: managing-epubs
 description: >-
   Creates, validates, inspects, updates, upgrades, and converts EPUB files (EPUB 3.3) with
   pandoc, EPUBCheck, and bundled Python scripts. Use when the user mentions EPUB, e-book,
@@ -13,7 +13,7 @@ compatibility: >-
 allowed-tools: Read Write Edit Glob Grep Bash(uv run --no-project ${CLAUDE_SKILL_DIR}/scripts/*) Bash(pandoc *) Bash(epubcheck *) Bash(unzip *) Bash(zipinfo *) Bash(jq *)
 ---
 
-# EPUB
+# Managing EPUBs
 
 An EPUB is a ZIP archive of XHTML content, a package document (OPF) that lists every file
 and holds the metadata, and a navigation document. Everything this skill produces targets

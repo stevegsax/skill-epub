@@ -5,12 +5,14 @@ converting EPUB files. Everything it produces targets EPUB 3 (W3C EPUB 3.3).
 
 ## Installation
 
-The skill's name is `epub`, and the Agent Skills specification expects a skill to live in a
-directory of that name. Clone or symlink this repository there:
+The skill's name is `managing-epubs` (a gerund, as Anthropic's skill-authoring guidance
+suggests, and specific enough that a passing mention of "epub" does not invoke it). The Agent
+Skills specification expects a skill to live in a directory of that name, so clone or symlink
+this repository there:
 
 ```bash
-git clone https://github.com/stevegsax/skill-epub ~/.claude/skills/epub
-# or, inside a project: git clone https://github.com/stevegsax/skill-epub .claude/skills/epub
+git clone https://github.com/stevegsax/skill-epub ~/.claude/skills/managing-epubs
+# or, inside a project: git clone https://github.com/stevegsax/skill-epub .claude/skills/managing-epubs
 ```
 
 Then install the command-line tools the skill drives:
